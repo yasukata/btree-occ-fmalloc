@@ -59,6 +59,7 @@ struct kvs_ops {
 };
 
 struct bench {
+	const char *filepath;
 	int num_runners;
 	long cnt;
 	size_t keylen;
@@ -101,7 +102,7 @@ static int _bt_delete(void *data, const char *key, uint32_t kl)
 
 static void _bt_init(struct bench *b)
 {
-	BKVS *db = createBTKVS();
+	BKVS *db = createBTKVS(b->filepath);
 	for (auto i = 0; i < b->num_runners; i++)
 		b->runners[i]->db = db;
 }
@@ -270,7 +271,7 @@ struct kvs_test_set {
 	{ "B+Tree", "bt", &bt_kvs_op },
 };
 
-#define OPTARGSTR "c:e:k:t:v:"
+#define OPTARGSTR "c:e:f:k:t:v:w"
 
 int main(int argc, char* const* argv)
 {
@@ -278,11 +279,13 @@ int main(int argc, char* const* argv)
 	unsigned int i;
 	const char *engine = "bt";
 	struct bench b;
+	bool do_write = false;
 
 	b.num_runners = 1;
 	b.keylen = 8;
 	b.vallen = 8;
 	b.cnt = 1;
+	b.filepath = NULL;
 
 	while ((ch = getopt(argc, argv, OPTARGSTR)) != -1) {
 		switch (ch) {
@@ -291,6 +294,9 @@ int main(int argc, char* const* argv)
 			break;
 		case 'e':
 			engine = optarg;
+			break;
+		case 'f':
+			b.filepath = optarg;
 			break;
 		case 'k':
 			b.keylen = atoi(optarg);
@@ -301,10 +307,18 @@ int main(int argc, char* const* argv)
 		case 'v':
 			b.vallen = atoi(optarg);
 			break;
+		case 'w':
+			do_write = true;
+			break;
 		default:
 			_D("unknown op %c", ch);
 			exit(1);
 		}
+	}
+
+	if (!b.filepath) {
+		_D("please specify a file path by -f");
+		exit(1);
 	}
 
 	_D("%d-thread, %ld entries (%ld per-thread), keylen %lu, vallen %lu",
@@ -329,8 +343,10 @@ int main(int argc, char* const* argv)
 
 	bench_init(&b);
 
-	_D("PUT entries...");
-	put_bench(&b);
+	if (do_write) {
+		_D("PUT entries...");
+		put_bench(&b);
+	}
 
 	(void) del_bench;
 

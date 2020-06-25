@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <pthread.h>
 
+#include <fmalloc.hpp>
+
 #include "kvs.hpp"
 
 #include "jenkins_hash.h"
@@ -89,10 +91,10 @@ struct bt_latch {
 
 struct bt_item {
 	struct bt_latch latch;
-	struct bt_item *chain;
+	fm_ptr<struct bt_item> chain;
 	uint32_t kl;
 	uint32_t vl;
-	struct bt_item *ptr;
+	fm_ptr<struct bt_item> ptr;
 	char data[0];
 };
 
@@ -100,8 +102,8 @@ struct bt_pg_hdr {
 	uint64_t del_time;
 	uint8_t leaf;
 	uint16_t __used_ent16;
-	struct bt_pg *__pre64;
-	struct bt_pg *__nxt64;
+	fm_ptr<struct bt_pg> __pre64;
+	fm_ptr<struct bt_pg> __nxt64;
 };
 
 struct bt_pg {
@@ -110,10 +112,10 @@ struct bt_pg {
 	uint64_t __key64[BT_MAX_ENT];
 	union {
 		struct {
-			struct bt_pg *__ptr64[BT_MAX_ENT+1];
+			fm_ptr<struct bt_pg> __ptr64[BT_MAX_ENT+1];
 		};
 		struct {
-			struct bt_item *__val64[BT_MAX_ENT+1];
+			fm_ptr<struct bt_item> __val64[BT_MAX_ENT+1];
 		};
 	};
 };
@@ -170,6 +172,10 @@ struct bt_del_info {
 	uint16_t del_depth;
 };
 
+struct bt_super {
+	fm_ptr<struct bt_pg> root;
+} __attribute__((packed));
+
 static inline void __bt_get_result(struct bt_cur *cur, struct bt_item *item)
 {
 	const std::vector<std::string> &fields = *(cur->fields);
@@ -216,7 +222,7 @@ static inline void __bt_put_result(struct bt_cur *cur, struct bt_item *old_item,
 				/* readers should never read freeing field */
 				std::atomic_thread_fence(std::memory_order_release);
 				new_field->ptr = old_field->ptr;
-				free(old_field);
+				ffree(old_field);
 				replaced = true;
 				break;
 			}
@@ -228,30 +234,34 @@ static inline void __bt_put_result(struct bt_cur *cur, struct bt_item *old_item,
 		new_field = new_tmp;
 	}
 
-	free(new_item);
+	ffree(new_item);
 }
 
 static int bt_fetch_cb_delete(struct bt_cur *cur, struct bt_pg *_p, uint16_t _i);
 
 static void *bt_alloc_obj(struct bt *bt, size_t size)
 {
-	(void) bt;
-	return malloc(size);
+	fmalloc_set_target(bt->fi);
+	return fmalloc(size);
 }
 
-static inline struct bt_pg *bt_pg_alloc(void)
+static inline struct bt_pg *bt_pg_alloc(struct bt *bt)
 {
-	struct bt_pg *pg = (struct bt_pg *) malloc(sizeof(struct bt_pg));
+	struct bt_pg *pg;
+	fmalloc_set_target(bt->fi);
+	pg = (struct bt_pg *) fmalloc(sizeof(struct bt_pg));
 	assert(pg);
 	memset(pg, 0, sizeof(struct bt_pg));
 	pg->latch.lock = 0;
 	return pg;
 }
 
-static struct bt *bt_create(void)
+static struct bt *bt_create(const char *filepath)
 {
+	struct bt_super *super;
 	struct bt_pg *pg;
 	struct bt *bt;
+	bool init = false;
 
 	bt = (struct bt *) malloc(sizeof(struct bt));
 	assert(bt);
@@ -262,10 +272,18 @@ static struct bt *bt_create(void)
 	bt->cur = (struct bt_cur **) malloc(sizeof(struct bt_cur *) * bt->max_cur);
 	assert(bt->cur);
 
-	bt->root = bt_pg_alloc();
-	pg = bt_pg_alloc();
-	pg->hdr.leaf = 1;
-	bt->root->__ptr64[0] = pg;
+	bt->fi = fmalloc_init(filepath, &init);
+	fmalloc_set_target(bt->fi);
+
+	super = (struct bt_super *) ((unsigned long) bt->fi->mem + PAGE_SIZE);
+
+	if (init) {
+		super->root = bt->root = bt_pg_alloc(bt);
+		pg = bt_pg_alloc(bt);
+		pg->hdr.leaf = 1;
+		bt->root->__ptr64[0] = pg;
+	} else
+		bt->root = super->root;
 
 	return bt;
 }
@@ -318,7 +336,7 @@ static inline void bt_do_pg_free(struct bt_cur *cur)
 			if (can_delete(cur, (*it)->hdr.del_time)) {
 				struct bt_pg *pg = *it;
 				it = cur->del_pg_list.erase(it);
-				free(pg);
+				ffree(pg);
 			} else {
 				++it;
 				all_clear = false;
@@ -590,6 +608,7 @@ static bool bt_lookup(struct bt_cur *cur, struct bt_pg *pg)
 	int err = 0;
 	uint8_t ver;
 	struct bt_pg *cpg;
+	fmalloc_set_target(cur->bt->fi);
 	bt_do_pg_free(cur);
 	set_enter_time(cur);
 	cur->fetch_cb = bt_fetch_cb_lookup;
@@ -627,9 +646,7 @@ static int bt_add_ent(struct bt_pg *pg, uint64_t key, uint64_t val)
 static void bt_split(struct bt_cur *cur, struct bt_pg *ppg, struct bt_pg *cpg)
 {
 	int i;
-	struct bt_pg *newpg = bt_pg_alloc();
-
-	(void) cur;
+	struct bt_pg *newpg = bt_pg_alloc(cur->bt);
 
 	memcpy(&newpg->__key64[0], &cpg->__key64[BT_MAX_ENT - BT_MAX_ENT/2], sizeof(uint64_t) * (BT_MAX_ENT - BT_MAX_ENT/2));
 	memcpy(&newpg->__val64[0], &cpg->__val64[BT_MAX_ENT - BT_MAX_ENT/2], sizeof(uint64_t) * (BT_MAX_ENT - BT_MAX_ENT/2 + 1));
@@ -658,7 +675,7 @@ static int bt_grow(struct bt_cur *cur, struct bt_pg *pg)
 {
 	struct bt_pg *newpg, *oldpg;
 	oldpg = pg->__ptr64[0];
-	newpg = bt_pg_alloc();
+	newpg = bt_pg_alloc(cur->bt);
 	newpg->hdr.__used_ent16 = 0;
 	newpg->__val64[0] = pg->__val64[0];
 	bt_split(cur, newpg, oldpg);
@@ -896,6 +913,7 @@ static int bt_insert(struct bt_cur *cur, struct bt_pg *pg)
 {
 	int err;
 	struct bt_pg *cpg;
+	fmalloc_set_target(cur->bt->fi);
 recheck:
 	if (cur->waitlock.load(std::memory_order_acquire))
 		goto recheck;
@@ -958,7 +976,7 @@ static int bt_fetch_cb_delete(struct bt_cur *cur, struct bt_pg *_p, uint16_t _i)
 		if (!cur->path[di->del_depth].in_lock)
 			BT_RELEASE(del_pg);
 	}
-	free(item);
+	ffree(item);
 	if (_p != pg) {
 		_p->__val64[_i] = pg->__val64[i];
 		memmove(&pg->__key64[i], &pg->__key64[i+1],
@@ -1294,6 +1312,7 @@ static int bt_delete(struct bt_cur *cur, struct bt_pg *pg)
 	int err;
 	struct bt_pg *cpg;
 	struct bt_del_info di;
+	fmalloc_set_target(cur->bt->fi);
 recheck:
 	if (cur->waitlock.load(std::memory_order_acquire))
 		goto recheck;
@@ -1325,6 +1344,7 @@ __thread std::unordered_map<std::string, struct bt_cur *> *__thread_bkvs_cur;
 
 class BTKVSImpl : public BKVS {
 private:
+	const char *filepath_;
 	std::unordered_map<std::string, struct bt *> trees;
 	pthread_mutex_t hash_mtx;
 
@@ -1342,7 +1362,7 @@ private:
 
 	struct bt *doCreate(void)
 	{
-		return bt_create();
+		return bt_create(filepath_);
 	}
 
 	struct bt_cur *fetch_cur(const char *table)
@@ -1375,7 +1395,7 @@ private:
 	}
 
 public:
-	BTKVSImpl()
+	BTKVSImpl(const char *filepath) : filepath_(filepath)
 	{
 		trees.clear();
 		pthread_mutex_init(&hash_mtx, NULL);
@@ -1487,8 +1507,8 @@ public:
 	}
 };
 
-BKVS *createBTKVS(void)
+BKVS *createBTKVS(const char *filepath)
 {
-	BTKVSImpl *i = new BTKVSImpl();
+	BTKVSImpl *i = new BTKVSImpl(filepath);
 	return i;
 }

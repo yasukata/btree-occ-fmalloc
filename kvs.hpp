@@ -161,6 +161,6 @@ public:
 	}
 };
 
-BKVS *createBTKVS(void);
+BKVS *createBTKVS(const char *filepath);
 
 #endif
